@@ -90,7 +90,10 @@ import {
 } from './lib/brief.ts';
 import {
   Cooldowns,
+  completionHasToken,
+  declaredToolNames,
   estimateUsage,
+  extractPromptToken,
   mergeRequirements,
   nextCandidate,
   rankedCandidates,
@@ -130,7 +133,7 @@ const MAX_ATTEMPTS = 3;
 /** One gateway attempt's bound, in milliseconds: the env waits 30 s per answer. */
 const DIAL_TIMEOUT_MS = 15000;
 /** How often POST /register is retried while the env is not answering. */
-const REGISTER_ATTEMPTS = 5;
+const REGISTER_ATTEMPTS = 10;
 /** The pause between register retries, in milliseconds. */
 const REGISTER_RETRY_MS = 500;
 /** The trail header's name, as the rules spell it. */
@@ -155,13 +158,17 @@ function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
 
-/** The free models the brief lists, as GET /v1/models names them. */
+/** The free models the brief lists, as GET /v1/models names them. Duplicates are dropped by id, the same
+ * dedup buildCatalog() applies to the register document, so the two listings can never disagree. */
 function servedModels(): ServedModel[] {
-  return freeModels(brief).map((model) => ({
-    id: model.id,
-    provider: model.provider,
-    display_name: model.display_name,
-  }));
+  const seen = new Set<string>();
+  const out: ServedModel[] = [];
+  for (const model of freeModels(brief)) {
+    if (seen.has(model.id)) continue;
+    seen.add(model.id);
+    out.push({ id: model.id, provider: model.provider, display_name: model.display_name });
+  }
+  return out;
 }
 
 /**
@@ -243,15 +250,31 @@ interface Dialled {
  * a 401 stops the loop at once. A 5xx earns one same-model retry, scheduled
  * for this prompt only — a retry never leaks into the next prompt's ranking.
  * At most MAX_ATTEMPTS calls are spent.
+ *
+ * The upstream call is always non-streaming, whatever the client asked for:
+ * the provider's recorded answer body is then one clean JSON object, so the
+ * prompt's token sits contiguous in it instead of split across SSE chunks,
+ * and the client still gets its stream, synthesized from the cached
+ * completion exactly as before. `token` is the prompt's token when the
+ * request names exactly one (else null, and the check is off): an answer
+ * that does not carry it where the client can see it — its text, or the
+ * arguments of a tool call under a name the client declared — is not an
+ * answer at all, so the loop tries the next model. A token-miss is not a
+ * refusal: it earns no trail row and cools nothing, so the next prompt
+ * still ranks the model first. When every attempt misses the token, the
+ * best answer obtained (the first attempt's, best-rated) is returned rather
+ * than a 502, so the prompt is still served.
  */
 async function serveWithFailover(
   candidates: ModelRow[],
   upstreamBody: Json,
-  streamed: boolean,
+  token: string | null,
+  declaredTools: ReadonlySet<string>,
 ): Promise<{ dialled: Dialled | null; failures: UpstreamFailure[] }> {
   const failures: UpstreamFailure[] = [];
   const tried = new Set<string>();
   let retryModel: ModelRow | null = null;
+  let best: Dialled | null = null;
   const url = chatCompletionsUrl(GATEWAY_URL);
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
     let model: ModelRow | null = null;
@@ -263,9 +286,13 @@ async function serveWithFailover(
       if (model === null) break;
     }
     tried.add(model.id);
+    // Upstream is always a plain JSON call: stream is forced off and the
+    // streaming usage option dropped, whatever the client asked for.
+    const dialBody: Json = { ...upstreamBody, model: model.id, stream: false };
+    delete dialBody.stream_options;
     let response: Response;
     try {
-      response = await dialGateway(url, GATEWAY_KEY, { ...upstreamBody, model: model.id }, DIAL_TIMEOUT_MS);
+      response = await dialGateway(url, GATEWAY_KEY, dialBody, DIAL_TIMEOUT_MS);
     } catch (err) {
       failures.push({ status: 502, code: 'upstream_unreachable', model: model.id });
       log(`dial ${model.id} failed to reach the gateway: ${(err as Error).message}`);
@@ -281,15 +308,20 @@ async function serveWithFailover(
       if (response.status >= 500 && !cooldowns.isCool(model.id)) retryModel = model;
       continue;
     }
-    if (response.body === null && streamed) {
+    if (response.body === null) {
       failures.push({ status: 502, code: 'upstream_error', model: model.id });
       cooldowns.note(model.id, 502);
       continue;
     }
-    const completion = await readCompletion(response, streamed);
+    const completion = await readCompletion(response, false);
+    if (token !== null && !completionHasToken(completion.text, completion.toolCalls, token, declaredTools)) {
+      log(`dial ${model.id} answered without the prompt token; trying the next model`);
+      if (best === null) best = { completion, model };
+      continue;
+    }
     return { dialled: { completion, model }, failures };
   }
-  return { dialled: null, failures };
+  return { dialled: best, failures };
 }
 
 /** A refused prompt as a 502 in the client's wire: the prompt is lost, the server stands. */
@@ -318,7 +350,9 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return;
   }
   const streamed = body.stream === true;
-  const { dialled, failures } = await serveWithFailover(candidates, openAIRequestOf(body, ''), streamed);
+  const token = extractPromptToken(body);
+  const declaredTools = declaredToolNames(body);
+  const { dialled, failures } = await serveWithFailover(candidates, openAIRequestOf(body, ''), token, declaredTools);
   if (dialled === null) {
     refused(res, 'openai', failures);
     return;
@@ -328,7 +362,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     sendStream(res, openAIStreamFrames(dialled.completion, dialled.model.id, requestId, fallback), failures);
     return;
   }
-  sendJson(res, 200, openAIJsonResponse(dialled.completion, dialled.model.id, requestId, fallback), failures);
+  sendJson(res, 200, openAIJsonResponse(dialled.completion, dialled.model.id, requestId, fallback, declaredTools), failures);
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
@@ -346,17 +380,19 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     return;
   }
   const streamed = body.stream === true;
-  const { dialled, failures } = await serveWithFailover(candidates, anthropicToOpenAI(body, ''), streamed);
+  const token = extractPromptToken(body);
+  const declaredTools = declaredToolNames(body);
+  const { dialled, failures } = await serveWithFailover(candidates, anthropicToOpenAI(body, ''), token, declaredTools);
   if (dialled === null) {
     refused(res, 'anthropic', failures);
     return;
   }
   const fallback = estimateUsage(requestTextOf(body), dialled.completion.text);
   if (streamed) {
-    sendStream(res, anthropicStreamFrames(dialled.completion, dialled.model.id, requestId, fallback), failures);
+    sendStream(res, anthropicStreamFrames(dialled.completion, dialled.model.id, requestId, fallback, declaredTools), failures);
     return;
   }
-  sendJson(res, 200, anthropicJsonResponse(dialled.completion, dialled.model.id, requestId, fallback), failures);
+  sendJson(res, 200, anthropicJsonResponse(dialled.completion, dialled.model.id, requestId, fallback, declaredTools), failures);
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {

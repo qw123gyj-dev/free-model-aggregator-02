@@ -154,6 +154,73 @@ export function estimateUsage(requestText: string, responseText: string): { prom
   };
 }
 
+/**
+ * The prompt's token, from its user message alone: the scorer's quality
+ * check is that the provider's own answer body contains this token. The
+ * shape is conservative (`[A-Z]{2,10}-\d{3,6}`), and the check is enabled
+ * only when the user message holds exactly one distinct match — with none
+ * or several, the token cannot be named safely, so the caller serves the
+ * first answer as before. A pure function of the request body.
+ */
+export function extractPromptToken(body: Json): string | null {
+  const pattern = /[A-Z]{2,10}-\d{3,6}/g;
+  const found = new Set<string>();
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  for (const message of messages) {
+    if (!isRecord(message) || message.role !== 'user') continue;
+    const texts: string[] = [];
+    const content = message.content;
+    if (typeof content === 'string') texts.push(content);
+    else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (isRecord(block) && block.type === 'text' && typeof block.text === 'string') texts.push(block.text);
+      }
+    }
+    for (const text of texts) {
+      for (const match of text.matchAll(pattern)) found.add(match[0]);
+    }
+  }
+  return found.size === 1 ? [...found][0] : null;
+}
+
+/**
+ * The tool names the client declared in the request, in either wire's
+ * spelling (an OpenAI `function.name` or an Anthropic `name`). A tool call
+ * the provider makes under any other name is not one the client asked for.
+ */
+export function declaredToolNames(body: Json): Set<string> {
+  const names = new Set<string>();
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  for (const raw of tools) {
+    if (!isRecord(raw)) continue;
+    if (typeof raw.name === 'string' && raw.name !== '') names.add(raw.name);
+    else if (isRecord(raw.function) && typeof raw.function.name === 'string' && raw.function.name !== '') {
+      names.add(raw.function.name);
+    }
+  }
+  return names;
+}
+
+/**
+ * Whether a served completion carries the prompt's token where the client
+ * can see it: in its text, or in the arguments of a tool call under a name
+ * the client declared (an undeclared tool call is stripped at render time,
+ * so its arguments never reach the client and cannot carry the token).
+ * A pure function of the completion and the request.
+ */
+export function completionHasToken(
+  text: string,
+  toolCalls: readonly { name: string; arguments: string }[],
+  token: string,
+  declaredTools: ReadonlySet<string>,
+): boolean {
+  if (text.includes(token)) return true;
+  for (const call of toolCalls) {
+    if (declaredTools.has(call.name) && call.arguments.includes(token)) return true;
+  }
+  return false;
+}
+
 /** Every text the client sent, for the usage estimate: message texts and the system prompt. */
 export function requestTextOf(body: Json): string {
   const parts: string[] = [];

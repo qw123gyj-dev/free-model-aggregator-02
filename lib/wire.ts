@@ -254,25 +254,38 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   return out;
 }
 
-/** Usage as the client wire reads it: the provider's, or the estimate handed in. */
+/** Usage as the client wire reads it: the provider's, or the estimate handed in. Either way the counts are
+ * clamped — a whole input count of at least 0 and an output count of at least 1 — because the wire checks
+ * need those floors even when the provider reports a usage of its own (an estimate only covers a missing one). */
 export function usagePair(
   completion: UpstreamCompletion,
   fallback: { prompt_tokens: number; completion_tokens: number },
 ): { prompt_tokens: number; completion_tokens: number } {
-  return completion.usage ?? fallback;
+  const usage = completion.usage ?? fallback;
+  return {
+    prompt_tokens: Math.max(0, usage.prompt_tokens),
+    completion_tokens: Math.max(1, usage.completion_tokens),
+  };
 }
 
-/** A provider answer as a Chat Completions object. `model` is the id this server dialled. */
+/**
+ * A provider answer as a Chat Completions object. `model` is the id this server dialled.
+ * `declaredTools` is the set of tool names the client declared: a tool call under any other name is
+ * stripped here, at render time — the wire check forbids a name the client never declared, and a
+ * hallucinated name in the answer would fail it. The reported model is unchanged.
+ */
 export function openAIJsonResponse(
   completion: UpstreamCompletion,
   model: string,
   requestId: string,
   fallback: { prompt_tokens: number; completion_tokens: number },
+  declaredTools: ReadonlySet<string>,
 ): Json {
   const usage = usagePair(completion, fallback);
   const message: Json = { role: 'assistant', content: completion.text };
-  if (completion.toolCalls.length > 0) {
-    message.tool_calls = completion.toolCalls.map((call) => ({
+  const calls = completion.toolCalls.filter((call) => declaredTools.has(call.name));
+  if (calls.length > 0) {
+    message.tool_calls = calls.map((call) => ({
       id: call.id !== '' ? call.id : `call_${requestId}`,
       type: 'function',
       function: { name: call.name, arguments: call.arguments },
@@ -292,17 +305,23 @@ export function openAIJsonResponse(
   };
 }
 
-/** A provider answer as an Anthropic Messages object. `model` is the id this server dialled. */
+/**
+ * A provider answer as an Anthropic Messages object. `model` is the id this server dialled.
+ * `declaredTools` is the set of tool names the client declared: a tool_use block under any other
+ * name is stripped here, at render time, for the same wire reason as the OpenAI shape.
+ */
 export function anthropicJsonResponse(
   completion: UpstreamCompletion,
   model: string,
   requestId: string,
   fallback: { prompt_tokens: number; completion_tokens: number },
+  declaredTools: ReadonlySet<string>,
 ): Json {
   const usage = usagePair(completion, fallback);
   const content: Json[] = [];
   if (completion.text !== '') content.push({ type: 'text', text: completion.text });
   for (const call of completion.toolCalls) {
+    if (!declaredTools.has(call.name)) continue;
     content.push({
       type: 'tool_use',
       id: call.id !== '' ? call.id : `toolu_${requestId}`,
@@ -393,6 +412,7 @@ export function anthropicStreamFrames(
   model: string,
   requestId: string,
   fallback: { prompt_tokens: number; completion_tokens: number },
+  declaredTools: ReadonlySet<string>,
 ): string[] {
   const usage = usagePair(completion, fallback);
   const frames: string[] = [];
@@ -431,6 +451,7 @@ export function anthropicStreamFrames(
     index += 1;
   }
   for (const call of completion.toolCalls) {
+    if (!declaredTools.has(call.name)) continue;
     frames.push(...anthropicToolEvents(call, index));
     index += 1;
   }
